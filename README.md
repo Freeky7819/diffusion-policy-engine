@@ -13,3 +13,5 @@ We use a differentiable reward (a context-shifted Rosenbrock function) so traini
 Standard denoising loss +
 ```python
 loss = mse(eps_hat, noise)  -  lambda_R * R(x, p0_pred)
+
+python dpe_main.py --epochs 12 --mppi_K 4
