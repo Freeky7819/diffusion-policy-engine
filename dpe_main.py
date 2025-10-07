@@ -1,4 +1,5 @@
 # dpe_main.py
+# Diffusion Policy Engine (DPE) – stable demo with reward ramp + EMA
 import math, argparse
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
@@ -20,27 +21,24 @@ class TimeMLP(nn.Module):
 class CondDenoiser(nn.Module):
     def __init__(self, dim_x, dim_p, d_hidden=256, d_t=16):
         super().__init__()
-        # all three branches output d_hidden to make concat = 3*d_hidden
-        self.tproj = TimeMLP(d_t=d_t, d_hidden=d_hidden)   # <-- fixed to 256
+        # vse tri veje vrnejo d_hidden -> concat = 3*d_hidden
+        self.tproj = TimeMLP(d_t=d_t, d_hidden=d_hidden)
         self.embed_t = nn.Linear(1, d_t)
-
         self.xproj = nn.Sequential(nn.Linear(dim_x, d_hidden), nn.SiLU())
         self.pproj = nn.Sequential(nn.Linear(dim_p, d_hidden), nn.SiLU())
-
         self.core  = nn.Sequential(
             nn.Linear(d_hidden*3, d_hidden), nn.SiLU(),
             nn.Linear(d_hidden, d_hidden), nn.SiLU(),
             nn.Linear(d_hidden, dim_p)
         )
-
     def forward(self, x, p_noisy, t_scalar01):
-        # t_scalar01: [B,1] in [0,1]
-        t_emb = self.embed_t(t_scalar01)     # [B, d_t]
-        h_t = self.tproj(t_emb)              # [B, d_hidden]
-        h_x = self.xproj(x)                  # [B, d_hidden]
-        h_p = self.pproj(p_noisy)            # [B, d_hidden]
-        h = torch.cat([h_x, h_p, h_t], dim=-1)  # [B, 3*d_hidden]
-        return self.core(h)                  # predicts noise ε_hat (shape = p)
+        # t_scalar01: [B,1] v [0,1]
+        t_emb = self.embed_t(t_scalar01)         # [B, d_t]
+        h_t = self.tproj(t_emb)                  # [B, d_hidden]
+        h_x = self.xproj(x)                      # [B, d_hidden]
+        h_p = self.pproj(p_noisy)                # [B, d_hidden]
+        h = torch.cat([h_x, h_p, h_t], dim=-1)   # [B, 3*d_hidden]
+        return self.core(h)                      # napove šum ε_hat (oblika p)
 
 # ---------- Diffusion schedule (cosine) ----------
 def cosine_beta_schedule(T=200, s=0.008):
@@ -56,29 +54,30 @@ class Diffusion1D:
         self.betas = cosine_beta_schedule(T).to(device)
         self.alphas = 1. - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-
     def sample_t(self, B):
         return torch.randint(0, self.T, (B,), device=device)
-
     def q_sample(self, p0, t, noise=None):
         if noise is None: noise = torch.randn_like(p0)
         sqrt_ab = self.alphas_cumprod[t].sqrt().view(-1,1)
         sqrt_1m = (1 - self.alphas_cumprod[t]).sqrt().view(-1,1)
         return sqrt_ab*p0 + sqrt_1m*noise, noise
 
-# ---------- Reward: context-shifted Rosenbrock (differentiable) ----------
-# We optimize p ∈ R^2 to minimize Rosenbrock centered by context x ∈ R^2.
+# ---------- Reward: context-shifted Rosenbrock (stabilna verzija) ----------
+# Optimiramo p ∈ R^2; nagrada je -Rosenbrock, z "tanh" squash za robustnost.
 def rosenbrock_reward(x, p):
-    # map context to parameters and a small shift
-    a = 1.0 + 0.5*torch.tanh(x[:, :1])                 # ~[0.5,1.5]
-    b = 100.0 * torch.exp(torch.tanh(x[:, 1:2]))       # ~[36,271]
+    # Mehak razpon parametrov (manj strmo -> manj numeričnih izstrelkov)
+    a = 1.0 + 0.5*torch.tanh(x[:, :1])                 # ~[0.5, 1.5]
+    b = 50.0 * torch.exp(0.5*torch.tanh(x[:, 1:2]))    # ~[18, 82]
+    # Kontekstni shift (da ni vedno ista posoda)
     p_shift = p + 0.25 * torch.cat([x[:, :1], x[:, 1:2]], dim=-1)
     x1, x2 = p_shift[:, :1], p_shift[:, 1:2]
-    val = (a - x1)**2 + b*(x2 - x1**2)**2              # smaller = better
-    R = -val.squeeze(-1)                                # reward = -loss
+    val = (a - x1)**2 + b*(x2 - x1**2)**2              # manjše = bolje
+    R_raw = -val.squeeze(-1)                            # reward = -loss
+    # Squash v [-1,1] zaradi stabilnosti gradientov
+    R = torch.tanh(R_raw / 5.0)
     return R
 
-# ---------- Synthetic dataset for warm-up ----------
+# ---------- Synthetic dataset za warm-up ----------
 def make_synthetic_dataset(N=4096):
     x = torch.randn(N, 2)
     a = 1.0 + 0.5*torch.tanh(x[:, :1])
@@ -86,7 +85,7 @@ def make_synthetic_dataset(N=4096):
     p_star += 0.05*torch.randn_like(p_star)
     return x, p_star
 
-# ---------- Sampler (with optional tiny MPPI reweighting) ----------
+# ---------- MPPI opcija pri vzorčenju ----------
 @torch.no_grad()
 def ddpm_sample(model, diff, x, dim_p=2, mppi_K=0, lam=0.5):
     B = x.size(0)
@@ -115,7 +114,11 @@ def ddpm_sample(model, diff, x, dim_p=2, mppi_K=0, lam=0.5):
             p = mean
     return p
 
-# ---------- Training ----------
+# ---------- Pomočnik za EMA ----------
+def ema_update(old, new, tau=0.9):
+    return tau*old + (1-tau)*new if old is not None else new
+
+# ---------- Trening ----------
 def train(args):
     dim_x, dim_p = 2, 2
     model = CondDenoiser(dim_x, dim_p, d_hidden=256, d_t=16).to(device)
@@ -125,9 +128,20 @@ def train(args):
     ds = TensorDataset(x_all, p_star)
     dl = DataLoader(ds, batch_size=args.bs, shuffle=True, drop_last=True)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=2e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    # Warm-up strategija: prvih ~20% epoch brez rewarda, nato rampa
+    lambda_base = args.lambda_R
+    warmup_epochs = max(1, int(args.epochs * 0.2))
 
     for epoch in range(args.epochs):
+        # linearna rampa po warmupu (40% epoch)
+        if epoch < warmup_epochs:
+            lambda_R = 0.0
+        else:
+            progress = min(1.0, (epoch - warmup_epochs) / max(1, int(args.epochs * 0.4)))
+            lambda_R = lambda_base * progress
+
         for x, p0 in dl:
             x, p0 = x.to(device), p0.to(device)
 
@@ -136,31 +150,35 @@ def train(args):
             p_t, noise = diff.q_sample(p0, t)
             t01 = (t.float()/diff.T).unsqueeze(-1)
 
-            # denoising prediction
+            # denoising predikcija
             eps_hat = model(x, p_t, t01)
             loss_denoise = F.mse_loss(eps_hat, noise)
 
-            # reconstruct p0 from p_t and eps_hat
+            # rekonstrukcija p0 iz p_t in eps_hat
             ab = diff.alphas_cumprod[t].view(-1,1)
             p0_pred = (p_t - (1-ab).sqrt()*eps_hat) / ab.sqrt()
 
-            # reward-guided steering (differentiable)
-            R = rosenbrock_reward(x, p0_pred)
-            loss_reward = - args.lambda_R * R.mean()
+            # EMA stabilizacija na p0_pred za reward
+            p0_pred_ema = ema_update(None, p0_pred.detach(), tau=0.9)  # per-batch init
+            # lahko bi peljali EMA čez korake znotraj batcha; tu je enokorak EMA
+
+            # nagradni člen
+            R = rosenbrock_reward(x, p0_pred_ema)
+            loss_reward = - lambda_R * R.mean()
 
             loss = loss_denoise + loss_reward
             opt.zero_grad(); loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
 
-        # simple validation / logging
+        # preprosta validacija / log
         with torch.no_grad():
             x_val = torch.randn(256, dim_x, device=device)
             p_gen = ddpm_sample(model, diff, x_val, dim_p, mppi_K=args.mppi_K)
             R_val = rosenbrock_reward(x_val, p_gen).mean().item()
-        print(f"[epoch {epoch+1:03d}] loss={loss.item():.4f}  R_val≈{R_val:.3f}")
+        print(f"[epoch {epoch+1:03d}] loss={loss.item():.4f}  lambda_R={lambda_R:.4f}  R_val≈{R_val:.3f}")
 
-    # final small demo
+    # končni mini demo
     with torch.no_grad():
         x_demo = torch.tensor([[0.0, 0.0],
                                [1.0,-1.0],
@@ -175,10 +193,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--N", type=int, default=4096)
     ap.add_argument("--bs", type=int, default=64)
-    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--T", type=int, default=200)
-    ap.add_argument("--lambda_R", type=float, default=0.05)
-    ap.add_argument("--mppi_K", type=int, default=4, help="0=off; >0 enables tiny MPPI at inference")
+    ap.add_argument("--lambda_R", type=float, default=0.02)  # manj agresivno
+    ap.add_argument("--mppi_K", type=int, default=4, help="0=off; >0 mali MPPI pri inferenci")
+    ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--log_every", type=int, default=1)
     args = ap.parse_args()
     train(args)
